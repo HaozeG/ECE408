@@ -10,10 +10,21 @@
     }                                                                     \
   } while (0)
 
+
 __global__ void spmvJDSKernel(float *out, int *matColStart, int *matCols,
                               int *matRowPerm, int *matRows,
                               float *matData, float *vec, int dim) {
   //@@ insert spmv kernel for jds format
+  int row = threadIdx.x + blockIdx.x * blockDim.x;
+  if (row < dim) {
+    float dot = 0.0f;
+    unsigned int sec = 0;
+    while (matRows[row] > sec) {
+      dot += vec[matCols[matColStart[sec] + row]] * matData[matColStart[sec] + row];
+      sec++;
+    }
+    out[matRowPerm[row]] = dot;
+  }
 }
 
 static void spmvJDS(float *out, int *matColStart, int *matCols,
@@ -21,6 +32,9 @@ static void spmvJDS(float *out, int *matColStart, int *matCols,
                     float *vec, int dim) {
 
   //@@ invoke spmv kernel for jds format
+  dim3 dimGrid(1, 1, 1);
+  dim3 dimBlock(dim, 1, 1);
+  spmvJDSKernel<<<dimGrid, dimBlock>>>(out, matColStart, matCols, matRowPerm, matRows, matData, vec, dim);
 }
 
 int main(int argc, char **argv) {
@@ -86,6 +100,7 @@ int main(int argc, char **argv) {
   spmvJDS(deviceOutput, deviceJDSColStart, deviceJDSCols, deviceJDSRowPerm, deviceJDSRows,
           deviceJDSData, deviceVector, dim);
   cudaDeviceSynchronize();
+  // wbCheck(cudaGetLastError());
   wbTime_stop(Compute, "Performing CUDA computation");
 
   wbTime_start(Copy, "Copying output memory to the CPU");

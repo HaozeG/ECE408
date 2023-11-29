@@ -5,6 +5,10 @@
 #define BLOCK_SIZE 8
 #define TILE_WIDTH 512
 
+// Shared memory matrix multiplication and input matrix unrolling 
+// Kernel fusion
+
+// kernel for input unrolling
 __global__ void input_X_unroll(float *X_unroll, const float *X, const int B, const int C, const int H, const int W, const int K, const int S)
 {
 

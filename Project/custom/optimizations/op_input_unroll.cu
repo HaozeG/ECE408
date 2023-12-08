@@ -3,7 +3,7 @@
 #include "gpu-new-forward.h"
 
 #define BLOCK_SIZE 8
-#define TILE_WIDTH 512
+#define TILE_WIDTH 1024
 
 // Shared memory matrix multiplication and input matrix unrolling 
 // Kernel fusion
@@ -141,26 +141,21 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 {
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-    float *device_input_temp;
-    int num_input_unroll = B * C * K * K * H_out * W_out;
     int size_input = sizeof(float) * B * C * H * W;
     int size_mask = sizeof(float) * M * C * K * K;
     int size_output = sizeof(float) * B * M * H_out * W_out;
 
     // Allocate memory and copy over the relevant data structures to the GPU
-    cudaMalloc((void **)device_input_ptr, sizeof(float) * num_input_unroll);
+    cudaMalloc((void **)device_input_ptr, size_input);
     cudaMalloc((void **)device_mask_ptr, size_mask);
     cudaMalloc((void **)device_output_ptr, size_output);
 
-    cudaMalloc((void **)&device_input_temp, size_input);
-    cudaMemcpy(device_input_temp, host_input, size_input, cudaMemcpyHostToDevice);
+    // cudaMalloc((void **)&device_input_temp, size_input);
+    cudaMemcpy(*device_input_ptr, host_input, size_input, cudaMemcpyHostToDevice);
     cudaMemcpy(*device_mask_ptr, host_mask, size_mask, cudaMemcpyHostToDevice);
     cudaMemset(*device_output_ptr, 0.0f, size_output);
 
-    // input unroll
-    dim3 dimGrid((H_out * W_out - 1)/TILE_WIDTH + 1, K * K, B * C);
-    dim3 dimBlock(TILE_WIDTH, 1, 1);
-    input_X_unroll<<<dimGrid, dimBlock>>>(*device_input_ptr, device_input_temp, B, C, H, W, K, S);
+
 
 
     // // mask unroll
@@ -172,7 +167,6 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     // mask_unroll<<<dimGrid_mask, dimBlock_mask>>>(*device_mask_unroll_ptr, *device_mask_ptr, M, C, K);
     // cudaFree(*device_mask_ptr);
 
-    cudaFree(device_input_temp);
 
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
@@ -193,12 +187,24 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
 {
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
+
+
+    float *device_input_temp;
+    int num_input_unroll = B * C * K * K * H_out * W_out;
+    cudaMalloc((void **)&device_input_temp, sizeof(float) * num_input_unroll);
+    // input unroll
+    dim3 dimGrid_unroll((H_out * W_out - 1)/TILE_WIDTH + 1, K * K, B * C);
+    dim3 dimBlock_unroll(TILE_WIDTH, 1, 1);
+    input_X_unroll<<<dimGrid_unroll, dimBlock_unroll>>>(device_input_temp, device_input, B, C, H, W, K, S);
+    cudaDeviceSynchronize();
+
     // Set the kernel dimensions and call the kernel
     dim3 dimGrid((H_out * W_out * B - 1)/BLOCK_SIZE + 1, (M - 1)/BLOCK_SIZE + 1, 1);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
 
-    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input_temp, device_mask, B, M, C, H, W, K, S);
 
+    cudaFree(device_input_temp);
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {

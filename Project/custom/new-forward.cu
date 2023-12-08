@@ -2,60 +2,8 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 
-#define BLOCK_SIZE 8
-#define TILE_WIDTH 512
-
-__global__ void input_X_unroll(float *X_unroll, const float *X, const int B, const int C, const int H, const int W, const int K, const int S)
-{
-
-    // Insert your GPU input unrolling kernel code here
-    const int H_out = (H - K)/S + 1;
-    const int W_out = (W - K)/S + 1;
-    #define out_3d(i2, i1, i0) X_unroll[(i2) * (C * K * K * H_out * W_out) + i1 * (H_out * W_out) + i0]
-    #define in_4d(i3, i2, i1, i0) X[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    int b = blockIdx.z / C;
-    int c = blockIdx.z % C;
-    int p = blockIdx.y / K;
-    int q = blockIdx.y % K;
-    // index in output matrix
-    int h_out = (threadIdx.x + blockIdx.x * TILE_WIDTH) / W_out;
-    int w_out = (threadIdx.x + blockIdx.x * TILE_WIDTH) % W_out;
-
-    // index of one unrolled matrix in one batch (not considering batch number)
-    int h_unroll = c * K * K + blockIdx.y;
-    int w_unroll = threadIdx.x + blockIdx.x * TILE_WIDTH;
-
-    // index in original matrix
-    int h = h_out * S + p;
-    int w = w_out * S + q;
-    if (h >= H || w >= W || h_unroll >= C * K * K || w_unroll >= H_out * W_out) {
-        return;
-    } else {
-        out_3d(b, h_unroll, w_unroll) = in_4d(b, c, h, w);
-    }
-    // out_3d(b, h_unroll, w_unroll) = in_4d(b, c, h, w);
-
-    #undef out_3d
-    #undef in_4d
-}
-
-
-__global__ void mask_unroll(float *mask_unroll, const float *mask, const int M, const int C, const int K)
-{
-    // Insert your GPU mask unrolling kernel code here
-    #define out_2d(i1, i0) mask_unroll[(i1) * (C * K * K) + i0]
-    #define mask_4d(i3, i2, i1, i0) mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-    int m = blockIdx.x;
-    int c = blockIdx.y;
-    int p = threadIdx.x / K;
-    int q = threadIdx.x % K;
-    out_2d(m, c * K * K + p * K + q) = mask_4d(m, c, p, q);
-    #undef out_2d
-    #undef mask_4d
-}
-
-// Shared memory matrix multiplication and input matrix unrolling
-__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+// tuning with restrict and loop unroll
+__global__ void conv_forward_kernel_7(float *output, const float * __restrict__ input, const float * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
 {
     /*
     Modify this function to implement the forward pass described in Chapter 16.
@@ -85,51 +33,108 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
     // float a = in_4d(0,0,0,0)
     // out_4d(0,0,0,0) = a
 
-    #define out_3d(i2, i1, i0) output[(i2) * (M * H_out * W_out) + (i1) * (H_out * W_out) + i0]
-    #define in_3d(i2, i1, i0) input[(i2) * (C * K * K * H_out * W_out) + i1 * (H_out * W_out) + i0]
-    #define mask_2d(i1, i0) mask[(i1) * (C * K * K) + i0]
-
+    __shared__ float mask_shared[16*4*7*7];
+    #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+    #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+    #define mask_4d(i3, i2, i1, i0) mask_shared[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     // Insert your GPU convolution kernel code here
-    __shared__ float subTileA[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float subTileB[BLOCK_SIZE][BLOCK_SIZE];
-
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int colomn = blockIdx.x * blockDim.x + threadIdx.x;
-    float Cvalue = 0;
-    int b = colomn / (H_out * W_out);
-    const int numAColumns = C*K*K;
-    const int numARows = M;
-    const int numBColumns = H_out * W_out * B;
-    const int numBRows = C*K*K;
-    const int numCColumns = numBColumns;
-    const int numCRows = numARows;
-
-    for (int i = 0; i < (numAColumns - 1)/BLOCK_SIZE + 1; ++i) {
-        if ((i * BLOCK_SIZE + threadIdx.x) >= numAColumns || row >= numARows) {
-            subTileA[threadIdx.y][threadIdx.x] = 0;
-        } else {
-            subTileA[threadIdx.y][threadIdx.x] = mask_2d(row, i * BLOCK_SIZE + threadIdx.x);
-        }
-        if ((i * BLOCK_SIZE + threadIdx.y) >= numBRows || colomn >= numBColumns) {
-            subTileB[threadIdx.y][threadIdx.x] = 0;
-        } else {
-            subTileB[threadIdx.y][threadIdx.x] = in_3d(b, (i * BLOCK_SIZE + threadIdx.y), colomn % (H_out * W_out));
-        }
-        __syncthreads();
-        if (row < numCRows && colomn < numCColumns) {
-            for (int k = 0; k < BLOCK_SIZE; ++k) {
-                Cvalue += subTileA[threadIdx.y][k] * subTileB[k][threadIdx.x];
-            }
-        }
-        __syncthreads();
+    int m = threadIdx.y;
+    int b = blockIdx.y;
+    int h = blockIdx.x;
+    int w = threadIdx.x;
+    float sum = 0.0f;
+    // copy into shared memory
+    for (int start = threadIdx.x + threadIdx.y*blockDim.x; start < M*C*K*K; start += blockDim.y*blockDim.x) {
+        // if (start < M*C*K*K) {
+            mask_shared[start] = mask[start];
+        // }
     }
-    if (row < numCRows && colomn < numCColumns) {
-        out_3d(b, row, colomn % (H_out * W_out)) = Cvalue;
+    __syncthreads();
+    // compute
+    for (int c = 0; c < C; c++) {
+        #pragma unroll 7
+        for (int p = 0; p < 7; p++) {
+            sum += in_4d(b, c, h*S + p, w*S + 0) * mask_4d(m, c, p, 0)
+                 + in_4d(b, c, h*S + p, w*S + 1) * mask_4d(m, c, p, 1)
+                 + in_4d(b, c, h*S + p, w*S + 2) * mask_4d(m, c, p, 2)
+                 + in_4d(b, c, h*S + p, w*S + 3) * mask_4d(m, c, p, 3)
+                 + in_4d(b, c, h*S + p, w*S + 4) * mask_4d(m, c, p, 4)
+                 + in_4d(b, c, h*S + p, w*S + 5) * mask_4d(m, c, p, 5)
+                 + in_4d(b, c, h*S + p, w*S + 6) * mask_4d(m, c, p, 6);
+            // for (int q = 0; q < K; q++) {
+            // }
+        }
     }
+    out_4d(b, m, h, w) = sum;
 
-    #undef out_3d
-    #undef in_3d
-    #undef mask_2d
+    #undef out_4d
+    #undef in_4d
+    #undef mask_4d
+}
+
+__global__ void conv_forward_kernel_3(float *output, const float * __restrict__ input, const float * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+{
+    /*
+    Modify this function to implement the forward pass described in Chapter 16.
+    We have added an additional dimension to the tensors to support an entire mini-batch
+    The goal here is to be correct AND fast.
+
+    Function paramter definitions:
+    output - output
+    input - input
+    mask - convolution kernel
+    B - batch_size (number of images in x)
+    M - number of output feature maps
+    C - number of input feature maps
+    H - input height dimension
+    W - input width dimension
+    K - kernel height and width (K x K)
+    S - stride step length
+    */
+
+    const int H_out = (H - K)/S + 1;
+    const int W_out = (W - K)/S + 1;
+    // (void)H_out; // silence declared but never referenced warning. remove this line when you start working
+    // (void)W_out; // silence declared but never referenced warning. remove this line when you start working
+
+    // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
+    // An example use of these macros:
+    // float a = in_4d(0,0,0,0)
+    // out_4d(0,0,0,0) = a
+
+    __shared__ float mask_shared[16*4*3*3];
+    #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+    #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+    #define mask_4d(i3, i2, i1, i0) mask_shared[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    // Insert your GPU convolution kernel code here
+    int m = threadIdx.y;
+    int b = blockIdx.y;
+    int h = blockIdx.x;
+    int w = threadIdx.x;
+    float sum = 0.0f;
+    // copy into shared memory
+    for (int start = threadIdx.x + threadIdx.y*blockDim.x; start < M*C*K*K; start += blockDim.y*blockDim.x) {
+        if (start < M*C*K*K) {
+            mask_shared[start] = mask[start];
+        }
+    }
+    __syncthreads();
+    // compute
+    for (int c = 0; c < C; c++) {
+        #pragma unroll 3
+        for (int p = 0; p < 3; p++) {
+            sum += in_4d(b, c, h*S + p, w*S + 0) * mask_4d(m, c, p, 0)
+            + in_4d(b, c, h*S + p, w*S + 1) * mask_4d(m, c, p, 1)
+            + in_4d(b, c, h*S + p, w*S + 2) * mask_4d(m, c, p, 2);
+            // for (int q = 0; q < K; q++) {
+            // }
+        }
+    }
+    out_4d(b, m, h, w) = sum;
+
+    #undef out_4d
+    #undef in_4d
+    #undef mask_4d
 }
 
 	
@@ -137,50 +142,28 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 {
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-    float *device_input_temp;
-    int num_input_unroll = B * C * K * K * H_out * W_out;
     int size_input = sizeof(float) * B * C * H * W;
     int size_mask = sizeof(float) * M * C * K * K;
     int size_output = sizeof(float) * B * M * H_out * W_out;
-
     // Allocate memory and copy over the relevant data structures to the GPU
-    cudaMalloc((void **)device_input_ptr, sizeof(float) * num_input_unroll);
+    cudaMalloc((void **)device_input_ptr, size_input);
     cudaMalloc((void **)device_mask_ptr, size_mask);
     cudaMalloc((void **)device_output_ptr, size_output);
 
-    cudaMalloc((void **)&device_input_temp, size_input);
-    cudaMemcpy(device_input_temp, host_input, size_input, cudaMemcpyHostToDevice);
+    cudaMemcpy(*device_input_ptr, host_input, size_input, cudaMemcpyHostToDevice);
     cudaMemcpy(*device_mask_ptr, host_mask, size_mask, cudaMemcpyHostToDevice);
     cudaMemset(*device_output_ptr, 0.0f, size_output);
-
-    // input unroll
-    dim3 dimGrid((H_out * W_out - 1)/TILE_WIDTH + 1, K * K, B * C);
-    dim3 dimBlock(TILE_WIDTH, 1, 1);
-    input_X_unroll<<<dimGrid, dimBlock>>>(*device_input_ptr, device_input_temp, B, C, H, W, K, S);
-
-
-    // // mask unroll
-    // float **device_mask_unroll_ptr = NULL;
-    // int num_mask_unroll = M * C * K * K;
-    // cudaMalloc((void **)device_mask_unroll_ptr, sizeof(float) * num_mask_unroll);
-    // dim3 dimGrid_mask(M, C, 1);
-    // dim3 dimBlock_mask(K * K, 1, 1);
-    // mask_unroll<<<dimGrid_mask, dimBlock_mask>>>(*device_mask_unroll_ptr, *device_mask_ptr, M, C, K);
-    // cudaFree(*device_mask_ptr);
-
-    cudaFree(device_input_temp);
-
+    
+    // We pass double pointers for you to initialize the relevant device pointers,
+    //  which are passed to the other two functions.
+    // std::cout<<"no error in prolog"<<std::endl;
+    // Useful snippet for error checking
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
     //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
     //     exit(-1);
     // }
-    // std::cout<<"no error in prolog"<<std::endl;
-
-    // We pass double pointers for you to initialize the relevant device pointers,
-    //  which are passed to the other two functions.
-    // Useful snippet for error checking
    
 }
 
@@ -190,18 +173,25 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
     // Set the kernel dimensions and call the kernel
-    dim3 dimGrid((H_out * W_out * B - 1)/BLOCK_SIZE + 1, (M - 1)/BLOCK_SIZE + 1, 1);
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
+    dim3 dimGrid(H_out, B, 1);
+    dim3 dimBlock(W_out, M, 1);
 
-    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    // print M
+    // std::cout<<"M: "<<M<<std::endl;
+    // std::cout<<"C: "<<C<<std::endl;
+    if (K == 7) {
+        conv_forward_kernel_7<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    } else if (K == 3) {
+        conv_forward_kernel_3<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    }
 
+    // std::cout<<"no error calling kernel"<<std::endl;
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
     //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
     //     exit(-1);
     // }
-    // std::cout<<"no error calling kernel"<<std::endl;
 
 }
 
@@ -211,22 +201,23 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *d
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
 
-    int size_output = sizeof(float) * H_out * W_out * B * M;
+    int outsize = sizeof(float) * H_out * W_out * B * M;
     // Copy the output back to host
-    cudaMemcpy(host_output, device_output, size_output, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_output, device_output, outsize, cudaMemcpyDeviceToHost);
    
     // Free device memory
     cudaFree(device_output);
     cudaFree(device_input);
     cudaFree(device_mask);
 
+    // std::cout<<"no error calling epilog"<<std::endl;
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
     //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
     //     exit(-1);
     // }
-    // std::cout<<"no error calling epilog"<<std::endl;
+    
 
 }
 
@@ -252,5 +243,3 @@ __host__ void GPUInterface::get_device_properties()
         std::cout<<"Warp Size: "<<deviceProp.warpSize<<std::endl;
     }
 }
-
-

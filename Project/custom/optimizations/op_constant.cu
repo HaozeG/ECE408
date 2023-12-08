@@ -2,12 +2,9 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 
-// baseline: param sweep + loop unroll
+__constant__ float mask_constant[8192];
 
-__constant__ float weight[5000];
-
-// tuning with const memory
-__global__ void conv_forward_kernel(float *output, const float * __restrict__ input, const float * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
 {
     /*
     Modify this function to implement the forward pass described in Chapter 16.
@@ -39,33 +36,19 @@ __global__ void conv_forward_kernel(float *output, const float * __restrict__ in
 
     #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    #define mask_4d(i3, i2, i1, i0) weight[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    #define mask_4d(i3, i2, i1, i0) mask_constant[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
     int b = blockIdx.x;
-    int m = threadIdx.y;
+    int m = blockIdx.z;
     int h = blockIdx.y;
     int w = threadIdx.x;
     float sum = 0.0f;
     for (int c = 0; c < C; c++) {
-        // #pragma unroll
         for (int p = 0; p < K; p++) {
-            if (K == 7) {
-                sum += in_4d(b, c, h*S + p, w*S + 0) * mask_4d(m, c, p, 0)
-                + in_4d(b, c, h*S + p, w*S + 1) * mask_4d(m, c, p, 1)
-                + in_4d(b, c, h*S + p, w*S + 2) * mask_4d(m, c, p, 2)
-                + in_4d(b, c, h*S + p, w*S + 3) * mask_4d(m, c, p, 3)
-                + in_4d(b, c, h*S + p, w*S + 4) * mask_4d(m, c, p, 4)
-                + in_4d(b, c, h*S + p, w*S + 5) * mask_4d(m, c, p, 5)
-                + in_4d(b, c, h*S + p, w*S + 6) * mask_4d(m, c, p, 6);
+            for (int q = 0; q < K; q++) {
+                sum += in_4d(b, c, h*S + p, w*S + q) * mask_4d(m, c, p, q);
             }
-            if (K == 3) {
-                sum += in_4d(b, c, h*S + p, w*S + 0) * mask_4d(m, c, p, 0)
-                + in_4d(b, c, h*S + p, w*S + 1) * mask_4d(m, c, p, 1)
-                + in_4d(b, c, h*S + p, w*S + 2) * mask_4d(m, c, p, 2);
-            }
-            // for (int q = 0; q < K; q++) {
-            // }
         }
     }
     out_4d(b, m, h, w) = sum;
@@ -90,7 +73,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 
     cudaMemcpy(*device_input_ptr, host_input, size_input, cudaMemcpyHostToDevice);
     // cudaMemcpy(*device_mask_ptr, host_mask, size_mask, cudaMemcpyHostToDevice);
-    cudaMemcpyToSymbol(weight, host_mask, size_mask);
+    cudaMemcpyToSymbol(mask_constant, host_mask, size_mask);
     cudaMemset(*device_output_ptr, 0.0f, size_output);
     
     // We pass double pointers for you to initialize the relevant device pointers,
@@ -112,8 +95,9 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
     // Set the kernel dimensions and call the kernel
-    dim3 dimGrid(B, H_out, 1);
-    dim3 dimBlock(W_out, M, 1);
+    dim3 dimGrid(B, H_out, M);
+    dim3 dimBlock(W_out, 1, 1);
+
     conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
 
     // std::cout<<"no error calling kernel"<<std::endl;

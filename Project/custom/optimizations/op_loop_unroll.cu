@@ -1,27 +1,9 @@
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
-#include <cuda_fp16.h>
-
-// baseline: param sweep + loop unroll
-
-__global__ void float_to_half_kernel(const float *input, half *output, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
-        output[i] = __float2half(input[i]);
-    }
-}
-
-__global__ void half_to_float(const half *input, float *output, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
-        output[i] = __half2float(input[i]);
-    }
-}
-
 
 // tuning with restrict and loop unroll
-__global__ void conv_forward_kernel(half *output, const half * __restrict__ input, const half * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+__global__ void conv_forward_kernel(float *output, const float * __restrict__ input, const float * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
 {
     /*
     Modify this function to implement the forward pass described in Chapter 16.
@@ -57,10 +39,10 @@ __global__ void conv_forward_kernel(half *output, const half * __restrict__ inpu
 
     // Insert your GPU convolution kernel code here
     int b = blockIdx.x;
-    int m = threadIdx.y;
+    int m = blockIdx.z;
     int h = blockIdx.y;
     int w = threadIdx.x;
-    half sum = 0;
+    float sum = 0.0f;
     for (int c = 0; c < C; c++) {
         // #pragma unroll
         for (int p = 0; p < K; p++) {
@@ -94,22 +76,22 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 {
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
+    int size_input = sizeof(float) * B * C * H * W;
+    int size_mask = sizeof(float) * M * C * K * K;
+    int size_output = sizeof(float) * B * M * H_out * W_out;
     // Allocate memory and copy over the relevant data structures to the GPU
-    int num_input = B * C * H * W;
-    int num_mask = M * C * K * K;
-    int num_output = B * M * H_out * W_out;
-    cudaMalloc((void **)device_input_ptr, sizeof(float) * num_input);
-    cudaMalloc((void **)device_mask_ptr, sizeof(float) * num_mask);
-    cudaMalloc((void **)device_output_ptr, sizeof(float) * num_output);
+    cudaMalloc((void **)device_input_ptr, size_input);
+    cudaMalloc((void **)device_mask_ptr, size_mask);
+    cudaMalloc((void **)device_output_ptr, size_output);
 
-    cudaMemcpy(*device_input_ptr, host_input, sizeof(float) * num_input, cudaMemcpyHostToDevice);
-    cudaMemcpy(*device_mask_ptr, host_mask, sizeof(float) * num_mask, cudaMemcpyHostToDevice);
-    // cudaMemset(*device_output_ptr, 0.0f, sizeof(float) * num_output);
+    cudaMemcpy(*device_input_ptr, host_input, size_input, cudaMemcpyHostToDevice);
+    cudaMemcpy(*device_mask_ptr, host_mask, size_mask, cudaMemcpyHostToDevice);
+    cudaMemset(*device_output_ptr, 0.0f, size_output);
     
     // We pass double pointers for you to initialize the relevant device pointers,
     //  which are passed to the other two functions.
     // std::cout<<"no error in prolog"<<std::endl;
-    // // Useful snippet for error checking
+    // Useful snippet for error checking
     // cudaError_t error = cudaGetLastError();
     // if(error != cudaSuccess)
     // {
@@ -124,34 +106,11 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
 {
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
-    int num_input = B * C * H * W;
-    int num_mask = M * C * K * K;
-    int num_output = B * M * H_out * W_out;
-
-    // convert float to FP16
-    half *device_input_half = NULL;
-    half *device_mask_half = NULL;
-    half *device_output_half = NULL;
-    dim3 dimGrid_convert(256, 1, 1);
-    dim3 dimBlock_convert(1024, 1, 1);
-    cudaMalloc((void **)&device_input_half, sizeof(half) * num_input);
-    cudaMalloc((void **)&device_mask_half, sizeof(half) * num_mask);
-    cudaMalloc((void **)&device_output_half, sizeof(half) * num_output);
-    float_to_half_kernel<<<dimGrid_convert, dimBlock_convert>>>(device_input, device_input_half, num_input);
-    float_to_half_kernel<<<dimGrid_convert, dimBlock_convert>>>(device_mask, device_mask_half, num_mask);
-    cudaDeviceSynchronize();
-
     // Set the kernel dimensions and call the kernel
-    dim3 dimGrid(B, H_out, 1);
-    dim3 dimBlock(W_out, M, 1);
-    conv_forward_kernel<<<dimGrid, dimBlock>>>((half *)device_output_half, (half *)device_input_half, (half *)device_mask_half, B, M, C, H, W, K, S);
+    dim3 dimGrid(B, H_out, M);
+    dim3 dimBlock(W_out, 1, 1);
 
-    // convert FP16 to float
-    half_to_float<<<dimGrid_convert, dimBlock_convert>>>(device_output_half, device_output, B * M * H_out * W_out);
-
-    cudaFree(device_input_half);
-    cudaFree(device_mask_half);
-    cudaFree(device_output_half);
+    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
 
     // std::cout<<"no error calling kernel"<<std::endl;
     // cudaError_t error = cudaGetLastError();
@@ -160,6 +119,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
     //     exit(-1);
     // }
+
 }
 
 
@@ -168,9 +128,9 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *d
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
 
-    int size_output = sizeof(float) * H_out * W_out * B * M;
+    int outsize = sizeof(float) * H_out * W_out * B * M;
     // Copy the output back to host
-    cudaMemcpy(host_output, device_output, size_output, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_output, device_output, outsize, cudaMemcpyDeviceToHost);
    
     // Free device memory
     cudaFree(device_output);
@@ -184,6 +144,8 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *d
     //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
     //     exit(-1);
     // }
+    
+
 }
 
 

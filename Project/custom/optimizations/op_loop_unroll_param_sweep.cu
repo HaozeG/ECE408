@@ -2,8 +2,6 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 
-// baseline: param sweep
-
 // tuning with restrict and loop unroll
 __global__ void conv_forward_kernel(float *output, const float * __restrict__ input, const float * __restrict__ mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
 {
@@ -40,9 +38,9 @@ __global__ void conv_forward_kernel(float *output, const float * __restrict__ in
     #define mask_4d(i3, i2, i1, i0) mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
-    int b = blockIdx.x;
     int m = threadIdx.y;
-    int h = blockIdx.y;
+    int b = blockIdx.y;
+    int h = blockIdx.x;
     int w = threadIdx.x;
     float sum = 0.0f;
     for (int c = 0; c < C; c++) {
@@ -109,7 +107,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     const int H_out = (H - K)/S + 1;
     const int W_out = (W - K)/S + 1;
     // Set the kernel dimensions and call the kernel
-    dim3 dimGrid(B, H_out, 1);
+    dim3 dimGrid(H_out, B, 1);
     dim3 dimBlock(W_out, M, 1);
 
     conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
